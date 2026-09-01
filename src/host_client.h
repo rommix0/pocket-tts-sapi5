@@ -1,0 +1,69 @@
+#pragma once
+
+// TCP client for the Pocket TTS host process. Used by both SAPI engine
+// DLLs (x86 and x64) and by the Voice Manager. Launches the host on
+// demand and keeps one connection per HostClient instance.
+
+#include <winsock2.h>
+#include <windows.h>
+#include <stdint.h>
+#include <string>
+#include <vector>
+
+#include "host_protocol.h"
+
+struct HostVoice {
+    std::wstring name;
+    bool female = false;
+    uint32_t lcid = 0x409;
+    bool published = false;
+    bool hasSource = false;
+};
+
+class HostClient {
+public:
+    // Returns false to stop the utterance (abort).
+    using AudioCallback = bool(*)(const char* pcm, uint32_t size, void* user);
+    // Progress text for long operations (clone, model update).
+    using ProgressCallback = void(*)(const std::wstring& message, void* user);
+
+    HostClient();
+    ~HostClient();
+
+    HostClient(const HostClient&) = delete;
+    HostClient& operator=(const HostClient&) = delete;
+
+    // Connects, starting the host process if necessary. Blocks up to
+    // `timeoutMs` while a cold host loads the model.
+    bool connect(DWORD timeoutMs = 90000);
+    bool isConnected() const { return sock_ != INVALID_SOCKET; }
+
+    bool speak(const std::string& voiceUtf8, const std::string& textUtf8,
+               AudioCallback callback, void* user);
+
+    bool listVoices(std::vector<HostVoice>& out, std::wstring& error);
+    bool cloneVoice(const std::wstring& name, const std::wstring& audioPath,
+                    bool female, const std::wstring& languageHex,
+                    ProgressCallback progress, void* user, std::wstring& error);
+    bool setPublished(const std::wstring& name, bool published, std::wstring& error);
+    bool deleteVoice(const std::wstring& name, std::wstring& error);
+    bool updateModels(const std::wstring& hfToken,
+                      ProgressCallback progress, void* user, std::wstring& error);
+    bool info(std::wstring& out);
+    void shutdownServer();
+
+    void disconnect();
+
+private:
+    bool ensureConnected(DWORD timeoutMs);
+    bool tryConnectOnce();
+    bool tryPort(unsigned short port);
+    bool launchHost();
+    bool sendFrame(uint32_t type, const void* data, uint32_t size);
+    bool readFrame(uint32_t& type, std::vector<char>& payload);
+    void setRecvTimeout(DWORD ms);
+
+    SOCKET sock_;
+    CRITICAL_SECTION cs_;
+    bool wsaReady_;
+};
