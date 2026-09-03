@@ -8,7 +8,7 @@
 ;                                           (installer\prepare_voices.py)
 
 #define MyAppName "Pocket TTS SAPI5"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "Josh Kennedy"
 
 [Setup]
@@ -27,7 +27,10 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 WizardStyle=modern
 UninstallDisplayName={#MyAppName}
+VersionInfoVersion={#MyAppVersion}
 SetupLogging=yes
+; A .pttsvoices association is added, so Explorer is told to reread it.
+ChangesAssociations=yes
 
 [Tasks]
 Name: "desktopicon"; Description: "Put the &Voice Manager on the desktop"
@@ -45,6 +48,13 @@ Source: "staging\models\*"; DestDir: "{commonappdata}\PocketTTS\models"; Flags: 
 ; upgrades never clobber the user's cloned voices.
 Source: "staging\voices\*"; DestDir: "{commonappdata}\PocketTTS\voices"; Excludes: "voices.ini"; Flags: ignoreversion recursesubdirs
 Source: "staging\voices\voices.ini"; DestDir: "{commonappdata}\PocketTTS\voices"; Flags: onlyifdoesntexist uninsneveruninstall
+
+[Registry]
+; Voice packages open in the Voice Manager, so a shared file can simply be
+; double-clicked. PrivilegesRequired=admin makes HKA resolve to HKLM.
+Root: HKA; Subkey: "Software\Classes\.pttsvoices"; ValueType: string; ValueName: ""; ValueData: "PocketTTS.VoicePackage"; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\PocketTTS.VoicePackage"; ValueType: string; ValueName: ""; ValueData: "Pocket TTS voice package"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\PocketTTS.VoicePackage\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\PocketTTSVoiceManager.exe"" ""%1"""
 
 [Dirs]
 ; Voice cloning and model updates run as the signed-in user.
@@ -65,6 +75,7 @@ Filename: "{app}\PocketTTSVoiceManager.exe"; Description: "Open the Voice Manage
 
 [UninstallRun]
 Filename: "{cmd}"; Parameters: "/c taskkill /f /im PocketTTSHost.exe"; Flags: runhidden; RunOnceId: "KillHost"
+Filename: "{cmd}"; Parameters: "/c taskkill /f /im PocketTTSVoiceManager.exe"; Flags: runhidden; RunOnceId: "KillManager"
 Filename: "{sys}\regsvr32.exe"; Parameters: "/s /u ""{app}\x64\PocketTTSSAPI.dll"""; Flags: runhidden; RunOnceId: "UnregX64"
 Filename: "{syswow64}\regsvr32.exe"; Parameters: "/s /u ""{app}\PocketTTSSAPI.dll"""; Flags: runhidden; RunOnceId: "UnregX86"
 
@@ -73,6 +84,21 @@ Filename: "{syswow64}\regsvr32.exe"; Parameters: "/s /u ""{app}\PocketTTSSAPI.dl
 Type: filesandordirs; Name: "{commonappdata}\PocketTTS\models"
 
 [Code]
+{ The engine host keeps the bundled Python runtime open and the Voice
+  Manager keeps its own binary open, so both are stopped before any file
+  is replaced. The host restarts on demand. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Result := '';
+  Exec(ExpandConstant('{cmd}'), '/c taskkill /f /im PocketTTSHost.exe',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{cmd}'), '/c taskkill /f /im PocketTTSVoiceManager.exe',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Sleep(1500);
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then

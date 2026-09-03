@@ -20,6 +20,7 @@ This project wraps that engine in a native SAPI5 interface; the wrapper itself i
 - **32-bit and 64-bit SAPI5 support** from a single always-warm engine process
 - **Fast**: ~100 ms to first audio once warm; speech cancellation in ~20 ms (screen-reader friendly)
 - **Voice cloning**: clone any voice from 10+ seconds of clean audio using the accessible Voice Manager
+- **Share voices**: export any or all of your voices — the built-in ones and the ones you cloned — to a single `.pttsvoices` file, and import voices other people send you; voices made with a different AI model are rebuilt automatically
 - **Instant publish / unpublish / delete** of voices in the SAPI voice list — no reboots, no registry hacking
 - **AI model updates** from Hugging Face inside the Voice Manager, with all cloned voices rebuilt automatically
 - **Rate (0.33x–3x), pitch, and volume** control via [sonic](https://github.com/waywardgeek/sonic) time-stretching, applied instantly even mid-utterance
@@ -42,6 +43,20 @@ After installation the Pocket TTS voices appear in every SAPI5 application. In N
 Open the **Pocket TTS Voice Manager**, choose **Clone New Voice**, pick a WAV or MP3 with at least 10 seconds (up to 30 seconds is used) of clean, single-speaker speech, name the voice, and clone. Test it with **Test Voice**, then **Publish to SAPI** to make it available to all applications. Unpublish or delete it at any time.
 
 > **Important — consent:** Kyutai's use policy prohibits voice impersonation or cloning without the speaker's **explicit and lawful consent**. Only clone voices you have permission to clone. See the [prohibited-use section](https://github.com/kyutai-labs/pocket-tts#prohibited-use) of the Pocket TTS README.
+
+## Sharing voices with other people
+
+Voices live on your own PC, so the Voice Manager can pack them into one file you can send to somebody else — and unpack one they send you.
+
+**To export.** Open the Voice Manager and choose **Export Voices**. Every voice is selected to begin with, so exporting all of them is just Export; use the list (or **Select All** / **Select None**) to send only some. Leave **Include the audio samples** ticked — it makes the file bigger, but it is what lets the other person's copy rebuild the voices if their AI model differs from yours. Choose where to save it and press **Export**. You get a single `.pttsvoices` file, ready to email or upload.
+
+**To import.** Choose **Import Voices** and pick the `.pttsvoices` file — or just open the file itself, which starts the Voice Manager on the import screen. The Voice Manager reads it first and tells you what is inside: how many voices, who made it, and whether they were made with the same AI model you have. Pick the voices you want, decide what should happen if a name is already taken (import under a new name, skip it, or replace the voice you have), and press **Import**.
+
+**About AI models.** A voice is a set of numbers derived from both the audio sample *and* the exact model weights it was made with, so a voice built on a different model will not sound right. The Voice Manager handles this for you: it compares the model the package was made with against yours and, when they differ, rebuilds each voice from its included audio sample. If the sender left the audio samples out and your models differ, the voice is still imported but flagged as possibly not sounding correct — ask them to export again with the samples included, or match their model with **Update AI Models**.
+
+**What is in the file.** A `.pttsvoices` file is an ordinary zip: `manifest.json`, one `voices/*.safetensors` embedding per voice, the audio samples under `src/` when included, and a `README.txt`. Every file is checksummed, and an import verifies the checksums, confirms each voice really is a Pocket TTS voice, and unpacks into a staging area first, so a damaged or hand-edited package cannot disturb the voices you already have.
+
+> **Important — consent again:** only share and install voices whose speaker has agreed to it. Importing a voice does not make it yours to use however you like.
 
 ## Updating the AI model (and getting a Hugging Face token)
 
@@ -95,7 +110,7 @@ SAPI application (32- or 64-bit)
                  └─ C:\ProgramData\PocketTTS\voices\           voices.ini + voice states
 ```
 
-Voices live in `voices.ini`; the enumerator DLL reads it directly, so publishing or removing a voice takes effect immediately with no registry changes. Rate, pitch, and volume are applied on the client side with sonic, so the model always speaks at its natural pace and rate changes are instant.
+Voices live in `voices.ini`; the enumerator DLL reads it directly, so publishing or removing a voice takes effect immediately with no registry changes. Exporting and importing `.pttsvoices` packages happens in the host process too, since it is the component that owns the voice store and the model needed to rebuild an imported voice. Rate, pitch, and volume are applied on the client side with sonic, so the model always speaks at its natural pace and rate changes are instant.
 
 ## Logs and troubleshooting
 

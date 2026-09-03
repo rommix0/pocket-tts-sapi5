@@ -3,22 +3,24 @@
 
 LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
 
-IDD_MAIN DIALOGEX 0, 0, 340, 230
+IDD_MAIN DIALOGEX 0, 0, 340, 276
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 CAPTION "Pocket TTS Voice Manager"
 FONT 9, "Segoe UI"
 BEGIN
     LTEXT           "&Voices:", -1, 8, 8, 100, 10
-    LISTBOX         IDC_VOICE_LIST, 8, 20, 200, 170, LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
+    LISTBOX         IDC_VOICE_LIST, 8, 20, 200, 216, LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
     PUSHBUTTON      "&Clone New Voice...", IDC_CLONE, 216, 20, 116, 16
     PUSHBUTTON      "&Test Voice...", IDC_TEST, 216, 40, 116, 16
     PUSHBUTTON      "&Publish to SAPI", IDC_PUBLISH, 216, 60, 116, 16
     PUSHBUTTON      "U&npublish from SAPI", IDC_UNPUBLISH, 216, 80, 116, 16
     PUSHBUTTON      "&Delete Voice...", IDC_DELETE, 216, 100, 116, 16
-    PUSHBUTTON      "Update AI &Models...", IDC_UPDATE, 216, 128, 116, 16
-    PUSHBUTTON      "&Refresh List", IDC_REFRESH, 216, 148, 116, 16
-    PUSHBUTTON      "Close", IDCANCEL, 216, 174, 116, 16
-    LTEXT           "Ready.", IDC_STATUS, 8, 198, 324, 24, SS_NOPREFIX
+    PUSHBUTTON      "&Export Voices...", IDC_EXPORT, 216, 124, 116, 16
+    PUSHBUTTON      "&Import Voices...", IDC_IMPORT, 216, 144, 116, 16
+    PUSHBUTTON      "Update AI &Models...", IDC_UPDATE, 216, 168, 116, 16
+    PUSHBUTTON      "&Refresh List", IDC_REFRESH, 216, 188, 116, 16
+    PUSHBUTTON      "Close", IDCANCEL, 216, 212, 116, 16
+    LTEXT           "Ready.", IDC_STATUS, 8, 244, 324, 24, SS_NOPREFIX
 END
 
 IDD_CLONE DIALOGEX 0, 0, 320, 190
@@ -65,4 +67,79 @@ BEGIN
     EDITTEXT        IDC_LOG, 8, 102, 324, 76, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
     DEFPUSHBUTTON   "&Update Now", IDOK, 204, 186, 62, 16
     PUSHBUTTON      "Cancel", IDCANCEL, 272, 186, 60, 16
+END
+
+IDD_EXPORT DIALOGEX 0, 0, 340, 262
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Export Voices for Sharing"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "&Voices to export. Every voice is selected; press the space bar to add or remove one.",
+                    -1, 8, 8, 324, 18
+    LISTBOX         IDC_EXPORT_LIST, 8, 28, 200, 84, LBS_MULTIPLESEL | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Select &All", IDC_EXPORT_ALL, 216, 28, 116, 16
+    PUSHBUTTON      "Select &None", IDC_EXPORT_NONE, 216, 48, 116, 16
+    CONTROL         "&Include the audio samples the voices were made from. Recommended: it lets other people rebuild the voices for their own AI model.",
+                    IDC_EXPORT_SOURCES, "Button", BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP, 8, 118, 324, 26
+    LTEXT           "&Save the voice package to:", -1, 8, 150, 324, 10
+    EDITTEXT        IDC_EXPORT_FILE, 8, 162, 240, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    PUSHBUTTON      "B&rowse...", IDC_EXPORT_BROWSE, 254, 162, 58, 14
+    LTEXT           "Progress:", -1, 8, 182, 100, 10
+    EDITTEXT        IDC_LOG, 8, 194, 324, 40, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON   "&Export", IDOK, 204, 240, 62, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 272, 240, 60, 16
+END
+
+IDD_IMPORT DIALOGEX 0, 0, 340, 306
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Import Voices from Another User"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT           "&Voice package file:", -1, 8, 8, 324, 10
+    EDITTEXT        IDC_IMPORT_FILE, 8, 20, 240, 14, ES_AUTOHSCROLL | WS_TABSTOP
+    PUSHBUTTON      "B&rowse...", IDC_IMPORT_BROWSE, 254, 20, 58, 14
+    LTEXT           "V&oices in the package. Every voice is selected; press the space bar to add or remove one.",
+                    -1, 8, 40, 324, 18
+    LISTBOX         IDC_IMPORT_LIST, 8, 60, 200, 76, LBS_MULTIPLESEL | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Select &All", IDC_IMPORT_ALL, 216, 60, 116, 16
+    PUSHBUTTON      "Select &None", IDC_IMPORT_NONE, 216, 80, 116, 16
+    LTEXT           "If a voice of the same name already e&xists:", -1, 8, 142, 324, 10
+    COMBOBOX        IDC_IMPORT_COLLISION, 8, 154, 200, 80, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL         "&Publish the imported voices to SAPI straight away",
+                    IDC_IMPORT_PUBLISH, "Button", BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP, 8, 174, 324, 18
+    LTEXT           "Only install voices whose speaker has agreed to be cloned. Kyutai's use policy prohibits cloning or impersonating a voice without the speaker's explicit and lawful consent.",
+                    -1, 8, 196, 324, 26
+    LTEXT           "Progress:", -1, 8, 226, 100, 10
+    EDITTEXT        IDC_LOG, 8, 238, 324, 40, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON   "&Import", IDOK, 204, 284, 62, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 272, 284, 60, 16
+END
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,1,0,0
+ PRODUCTVERSION 1,1,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Josh Kennedy"
+            VALUE "FileDescription", "Pocket TTS Voice Manager"
+            VALUE "FileVersion", "1.1.0.0"
+            VALUE "InternalName", "PocketTTSVoiceManager"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Josh Kennedy"
+            VALUE "OriginalFilename", "PocketTTSVoiceManager.exe"
+            VALUE "ProductName", "Pocket TTS SAPI5"
+            VALUE "ProductVersion", "1.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
 END

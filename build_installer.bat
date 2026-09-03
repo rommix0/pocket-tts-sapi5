@@ -24,8 +24,8 @@ if not exist "%ROOT%runtime\PocketTTSHost.exe" (
     if errorlevel 1 exit /b 1
 )
 
-if not exist "%ROOT%installer\staging\voices\voices.ini" (
-    echo Building the default voice payload...
+if not exist "%ROOT%installer\staging\models\english\model.safetensors" (
+    echo Staging the model and the default voice payload...
     "%USERPROFILE%\.pockettts\venv\Scripts\python.exe" "%ROOT%installer\prepare_voices.py"
     if errorlevel 1 exit /b 1
 )

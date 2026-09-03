@@ -10,8 +10,11 @@ little-endian, strings are UTF-8 length-prefixed inside payloads.
 """
 
 import ctypes
+import hashlib
+import json
 import logging
 import os
+import re
 import shutil
 import socket
 import struct
@@ -19,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -54,6 +58,9 @@ PORTS = (17853, 17854, 17855, 17856, 17857)
 PORT_FILE = _local_dir() / "host.port"
 LOG_FILE = _local_dir() / "host.log"
 
+# Kept in step with CMakeLists.txt and installer/pockettts.iss.
+APP_VERSION = "1.1.0"
+
 # Commands
 CMD_PING = 0
 CMD_LIST_VOICES = 1
@@ -65,6 +72,9 @@ CMD_DELETE_VOICE = 6
 CMD_UPDATE_MODELS = 7
 CMD_SHUTDOWN = 8
 CMD_INFO = 9
+CMD_EXPORT_VOICES = 10
+CMD_IMPORT_VOICES = 11
+CMD_INSPECT_PACKAGE = 12
 
 # Responses
 RESP_OK = 0
@@ -75,8 +85,60 @@ RESP_VOICES = 4
 RESP_PONG = 5
 RESP_PROGRESS = 6
 RESP_INFO = 7
+RESP_PACKAGE = 8
 
 logger = logging.getLogger("pockettts_host")
+
+# ---------------------------------------------------------------------------
+# Voice packages (.pttsvoices): sharing voices between computers
+# ---------------------------------------------------------------------------
+#
+# A package is a plain zip holding manifest.json, one voices/<name>.safetensors
+# per voice and, when the sender chose to include them, the audio samples in
+# src/. The manifest records a fingerprint of the AI model the embeddings were
+# produced with: a voice only sounds right on the model that made it, so an
+# import re-embeds from the audio sample whenever the two models differ.
+
+PACKAGE_FORMAT = 1
+PACKAGE_KIND = "pocket-tts-voice-package"
+PACKAGE_EXT = ".pttsvoices"
+PACKAGE_MANIFEST = "manifest.json"
+PACKAGE_MAX_MEMBER_BYTES = 512 * 1024 * 1024
+PACKAGE_MAX_VOICES = 500
+# An import writes at most this much, however many voices claim to be in
+# the package: several manifest entries may name one huge archive member.
+PACKAGE_MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+# The extension of a packaged sample becomes part of a file name and of a
+# voices.ini value, so only these are carried across.
+_AUDIO_SUFFIXES = frozenset(
+    [".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wma"])
+
+PACKAGE_README = """Pocket TTS voice package
+========================
+
+This file is a voice package written by the Pocket TTS SAPI5 Voice Manager. It
+holds one or more Pocket TTS voices: the voice embedding of each voice, in
+voices/*.safetensors, and, when the sender included them, the audio samples the
+voices were made from, in src/.
+
+To install these voices, open the Pocket TTS Voice Manager on a Windows PC that
+has Pocket TTS SAPI5 installed, choose "Import Voices", and pick this file. You
+can also simply open this file. If the AI model on that PC differs from the
+sender's, the Voice Manager rebuilds each voice automatically, as long as the
+audio sample is included here.
+
+Pocket TTS SAPI5:  https://github.com/joshknnd1982/pocket-tts-sapi5
+Pocket TTS engine and models, by Kyutai:
+                   https://github.com/kyutai-labs/pocket-tts
+
+Consent
+-------
+Kyutai's use policy prohibits cloning or impersonating a person's voice without
+that person's explicit and lawful consent. Only share and install voices the
+speaker has agreed to. The default voices (Alba, Jane, George and Michael) come
+from Kyutai's kyutai/tts-voices dataset; see that repository for their
+individual licenses.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -118,9 +180,9 @@ class VoiceStore:
     def write(self, voices: dict) -> None:
         lines = []
         for name, props in voices.items():
-            lines.append(f"[{name}]")
+            lines.append(f"[{_ini_safe(name)}]")
             for key, value in props.items():
-                lines.append(f"{key}={value}")
+                lines.append(f"{_ini_safe(key)}={_ini_safe(value)}")
             lines.append("")
         content = "\r\n".join(lines)
         fd, tmp = tempfile.mkstemp(dir=str(VOICES_DIR), suffix=".tmp")
@@ -477,11 +539,663 @@ class Engine:
         self.clear_cache()
         progress("Model update complete.")
 
+    # -- voice packages -----------------------------------------------------
+
+    def export_voices(self, names, dest_path, include_sources, progress):
+        """Write the named voices, or every voice when `names` is empty, to a
+        .pttsvoices package. Returns a summary line for the Voice Manager."""
+        voices = STORE.read()
+        wanted = [n for n in (names or list(voices)) if n in voices]
+        skipped = [n for n in (names or []) if n not in voices]
+        if not wanted:
+            raise ValueError("none of the selected voices exist any more")
+        if len(wanted) > PACKAGE_MAX_VOICES:
+            raise ValueError(
+                f"a package holds at most {PACKAGE_MAX_VOICES} voices")
+
+        dest = Path(dest_path)
+        if not dest.name:
+            raise ValueError("no destination file was given")
+        if dest.suffix.lower() != PACKAGE_EXT:
+            dest = dest.with_name(dest.name + PACKAGE_EXT)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        progress("Identifying the AI model these voices were made with...")
+        model = _model_fingerprint()
+
+        entries = []
+        stems = set()
+        tmp = dest.parent / (dest.name + ".part")
+        try:
+            with zipfile.ZipFile(tmp, "w", allowZip64=True) as zf:
+                for name in wanted:
+                    props = voices[name]
+                    state = VOICES_DIR / props.get("file",
+                                                   name + ".safetensors")
+                    if not state.exists():
+                        progress(f'Skipping "{name}": its voice file is '
+                                 "missing from this computer.")
+                        skipped.append(name)
+                        continue
+                    stem = _member_stem(name, stems)
+                    state_member = f"voices/{stem}.safetensors"
+                    progress(f'Adding "{name}" '
+                             f"({_human_size(state.stat().st_size)})...")
+                    # Voice embeddings are dense float data that deflate
+                    # cannot shrink, so they go in uncompressed.
+                    zf.write(state, state_member,
+                             compress_type=zipfile.ZIP_STORED)
+                    entry = {
+                        "name": name,
+                        "gender": ("Female"
+                                   if props.get("gender", "").lower()
+                                   == "female" else "Male"),
+                        "language": _clean_language(props.get("language")),
+                        "published": props.get("published", "0") == "1",
+                        "state_member": state_member,
+                        "state_sha256": _sha256_file(state),
+                        "source_member": None,
+                        "source_sha256": None,
+                    }
+                    source_rel = props.get("source", "")
+                    source = (VOICES_DIR / source_rel) if source_rel else None
+                    if include_sources and source is not None and source.exists():
+                        member = f"src/{stem}{source.suffix.lower()}"
+                        progress(f'Adding the audio sample for "{name}" '
+                                 f"({_human_size(source.stat().st_size)})...")
+                        zf.write(source, member,
+                                 compress_type=zipfile.ZIP_DEFLATED,
+                                 compresslevel=6)
+                        entry["source_member"] = member
+                        entry["source_sha256"] = _sha256_file(source)
+                    elif include_sources:
+                        progress(f'"{name}" has no audio sample on this '
+                                 "computer, so it cannot be rebuilt for a "
+                                 "different AI model.")
+                    entries.append(entry)
+
+                if not entries:
+                    raise ValueError(
+                        "none of the selected voices could be read")
+
+                manifest = {
+                    "kind": PACKAGE_KIND,
+                    "format": PACKAGE_FORMAT,
+                    "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                 time.gmtime()),
+                    "created_by": ("Pocket TTS SAPI5 Voice Manager "
+                                   + APP_VERSION),
+                    "pocket_tts_version": _pocket_tts_version(),
+                    "sample_rate": 24000,
+                    "model": model,
+                    "voices": entries,
+                }
+                zf.writestr(PACKAGE_MANIFEST,
+                            json.dumps(manifest, indent=2, ensure_ascii=False),
+                            compress_type=zipfile.ZIP_DEFLATED,
+                            compresslevel=6)
+                zf.writestr("README.txt", PACKAGE_README,
+                            compress_type=zipfile.ZIP_DEFLATED,
+                            compresslevel=6)
+            os.replace(tmp, dest)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+
+        with_source = sum(1 for e in entries if e["source_member"])
+        parts = [f"Exported {len(entries)} voice(s) to {dest} "
+                 f"({_human_size(dest.stat().st_size)})."]
+        parts.append(f"{with_source} of {len(entries)} include the audio "
+                     "sample they were made from.")
+        if skipped:
+            parts.append("Skipped: " + ", ".join(sorted(set(skipped))) + ".")
+        logger.info("exported %d voice(s) to %s", len(entries), dest)
+        return " ".join(parts)
+
+    def inspect_package(self, path):
+        """Describe a package without changing anything.
+
+        Returns (summary, rows) where each row is
+        (name, female, has_source, status) and status is 0 for a voice made
+        with this computer's model, 1 for another model but rebuildable from
+        its audio sample, and 2 for another model with no audio sample."""
+        manifest = _read_manifest(Path(path))
+        package_sha = str((manifest.get("model") or {}).get("sha256") or "")
+        local_sha = str(_model_fingerprint().get("sha256") or "")
+        same_model = bool(package_sha) and package_sha == local_sha
+        existing = STORE.read()
+
+        rows = []
+        clashes = []
+        for entry in manifest.get("voices", []):
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "")).strip()
+            if not name:
+                continue
+            has_source = bool(entry.get("source_member"))
+            status = 0 if same_model else (1 if has_source else 2)
+            female = str(entry.get("gender", "")).lower() == "female"
+            rows.append((name, female, has_source, status))
+            if _sanitize_name(name) in existing:
+                clashes.append(name)
+        if not rows:
+            raise ValueError("this package contains no voices")
+
+        created = str(manifest.get("created_utc", "")).replace("T", " ")
+        created = created.replace("Z", " UTC")
+        by = str(manifest.get("created_by", "an unknown version"))
+        parts = [f"{len(rows)} voice(s) in this package, written {created} "
+                 f"by {by}."]
+        if same_model:
+            parts.append("They were made with the same AI model as this "
+                         "computer, so they will sound exactly as intended.")
+        else:
+            rebuildable = sum(1 for row in rows if row[3] == 1)
+            risky = sum(1 for row in rows if row[3] == 2)
+            parts.append("They were made with a different AI model than this "
+                         "computer.")
+            if rebuildable:
+                parts.append(f"{rebuildable} of them include the audio sample "
+                             "and will be rebuilt for your model "
+                             "automatically.")
+            if risky:
+                parts.append(f"{risky} of them have no audio sample and may "
+                             "not sound correct; ask the sender to export "
+                             "again with the audio samples included.")
+        if clashes:
+            parts.append("Already on this computer: "
+                         + ", ".join(sorted(set(clashes)))
+                         + ". Choose below what should happen to those.")
+        return " ".join(parts), rows
+
+    def import_voices(self, path, names, publish, collision, progress):
+        """Install voices from a package. `collision` says what to do with a
+        name that already exists: 0 skip it, 1 import under a new name,
+        2 replace the existing voice."""
+        archive = Path(path)
+        manifest = _read_manifest(archive)
+        package_sha = str((manifest.get("model") or {}).get("sha256") or "")
+        local_sha = str(_model_fingerprint().get("sha256") or "")
+        same_model = bool(package_sha) and package_sha == local_sha
+
+        wanted = set(names or [])
+        entries = [e for e in manifest.get("voices", [])
+                   if isinstance(e, dict)
+                   and (not wanted
+                        or str(e.get("name", "")).strip() in wanted)]
+        if not entries:
+            raise ValueError("none of the selected voices are in this package")
+
+        VOICES_DIR.mkdir(parents=True, exist_ok=True)
+        VOICES_SRC_DIR.mkdir(parents=True, exist_ok=True)
+
+        imported = []
+        renamed = []
+        replaced = []
+        clashed = []    # left alone because the name is already taken
+        failed = []     # something went wrong with that voice
+        rebuilt = []
+        risky = []
+
+        budget = [PACKAGE_MAX_TOTAL_BYTES]
+        with zipfile.ZipFile(archive) as zf:
+            for entry in entries:
+                name = str(entry.get("name", "")).strip()
+                safe = _sanitize_name(name)
+                if not safe:
+                    progress(f'Skipping "{name}": that name cannot be used '
+                             "for a voice.")
+                    failed.append(name or "(unnamed)")
+                    continue
+
+                voices = STORE.read()
+                # Windows file names ignore case, so "alba" and "Alba" are the
+                # same voice however differently the package spells it.
+                by_lower = {existing.lower(): existing for existing in voices}
+                clash = by_lower.get(safe.lower())
+                target = safe
+                replacing = None
+                if clash is not None:
+                    if collision == 0:
+                        progress(f'Skipping "{clash}": a voice with that name '
+                                 "already exists.")
+                        clashed.append(clash)
+                        continue
+                    if collision == 2:
+                        target = clash
+                        replacing = dict(voices[clash])
+                        progress(f'Replacing the existing voice "{clash}"...')
+
+                try:
+                    if clash is not None and collision == 1:
+                        target = _unique_name(safe, voices)
+                        progress(f'"{clash}" already exists, so this one is '
+                                 f'being imported as "{target}".')
+                    self._install_package_voice(
+                        zf, entry, target, replacing, same_model, publish,
+                        progress, budget)
+                except Exception as exc:   # noqa: BLE001
+                    logger.exception("importing %r failed", name)
+                    progress(f'Could not import "{target}": {exc}')
+                    failed.append(target)
+                    continue
+
+                imported.append(target)
+                if replacing is not None:
+                    replaced.append(target)
+                elif clash is not None:
+                    renamed.append(target)
+                if not same_model:
+                    if entry.get("source_member"):
+                        rebuilt.append(target)
+                    else:
+                        risky.append(target)
+
+        if not imported:
+            reasons = []
+            if clashed:
+                reasons.append(
+                    "these already exist on this computer, and the box was "
+                    "set to skip them: " + ", ".join(clashed))
+            if failed:
+                reasons.append("these could not be read from the package: "
+                               + ", ".join(failed))
+            raise RuntimeError(
+                "no voices were imported. "
+                + ("; ".join(reasons) + "." if reasons
+                   else "See the progress list for details."))
+
+        parts = ["Imported " + str(len(imported)) + " voice(s): "
+                 + ", ".join(imported) + "."]
+        parts.append("They are published to SAPI and available to every "
+                     "application now."
+                     if publish else
+                     "They are not published yet: select a voice and choose "
+                     "Publish to SAPI to make it available to other "
+                     "applications.")
+        if renamed:
+            parts.append("Renamed to avoid a clash: " + ", ".join(renamed)
+                         + ".")
+        if replaced:
+            parts.append("Replaced: " + ", ".join(replaced) + ".")
+        if rebuilt:
+            parts.append("Rebuilt for your AI model: " + ", ".join(rebuilt)
+                         + ".")
+        if risky:
+            parts.append("Made with a different AI model and supplied without "
+                         "an audio sample, so they may not sound correct: "
+                         + ", ".join(risky) + ".")
+        if clashed:
+            parts.append("Skipped because a voice of that name already "
+                         "exists: " + ", ".join(clashed) + ".")
+        if failed:
+            parts.append("Could not be imported: " + ", ".join(failed)
+                         + ". See the progress list for the reason.")
+        logger.info("imported %d voice(s) from %s", len(imported), archive)
+        return " ".join(parts)
+
+    def _install_package_voice(self, zf, entry, target, replacing, same_model,
+                               publish, progress, budget):
+        """Unpack one voice out of an open package and register it.
+
+        Everything that can fail -- unpacking, the integrity and format
+        checks, and re-embedding the voice for a different AI model -- happens
+        inside a staging directory. The voice store is only touched once all
+        of it has succeeded, so a package that fails half way through cannot
+        damage a voice the user already had. The embedding is put in place
+        last, because it is the part that cannot be recreated."""
+        state_info = _package_member(zf, entry.get("state_member"))
+        source_ref = entry.get("source_member")
+        source_info = _package_member(zf, source_ref) if source_ref else None
+
+        staging = Path(tempfile.mkdtemp(dir=str(VOICES_DIR),
+                                        prefix="import-"))
+        try:
+            progress(f'Unpacking "{target}"...')
+            staged_state = staging / "voice.safetensors"
+            _extract_member(zf, state_info, staged_state,
+                            entry.get("state_sha256"), budget)
+            _validate_state_file(staged_state)
+
+            staged_source = None
+            suffix = ""
+            if source_info is not None:
+                # The extension ends up in a file name and in voices.ini, so
+                # only known audio extensions are carried over from the
+                # package; anything else is treated as a WAV.
+                suffix = Path(source_info.filename).suffix.lower()
+                if suffix not in _AUDIO_SUFFIXES:
+                    suffix = ".wav"
+                staged_source = staging / ("sample" + suffix)
+                _extract_member(zf, source_info, staged_source,
+                                entry.get("source_sha256"), budget)
+
+            if not same_model:
+                if staged_source is not None:
+                    if self.model is None:
+                        raise RuntimeError(
+                            self.load_error
+                            or "the AI model is not loaded, so this voice "
+                               "cannot be rebuilt for it")
+                    if not self.model.has_voice_cloning:
+                        raise RuntimeError(
+                            "this voice was made with a different AI model, "
+                            "and the installed model cannot rebuild voices")
+                    progress(f'Rebuilding "{target}" for your AI model '
+                             "(this can take a minute)...")
+                    from pocket_tts.models.model_state import export_model_state
+                    with self.gen_lock:
+                        state = self.model.get_state_for_audio_prompt(
+                            staged_source, truncate=True)
+                    export_model_state(state, staged_state)
+                    _validate_state_file(staged_state)
+                else:
+                    progress(f'"{target}" was made with a different AI model '
+                             "and came without its audio sample, so it may "
+                             "not sound correct.")
+
+            # Nothing below here is allowed to fail in a way that loses data.
+            state_name = f"{target}.safetensors"
+            state_dest = VOICES_DIR / state_name
+            source_name = (target + suffix) if staged_source is not None else ""
+            source_dest = ((VOICES_SRC_DIR / source_name)
+                           if staged_source is not None else None)
+
+            if staged_source is not None:
+                os.replace(staged_source, source_dest)
+            os.replace(staged_state, state_dest)
+
+            def mutate(voices):
+                props = {
+                    "file": state_name,
+                    "gender": ("Female"
+                               if str(entry.get("gender", "")).lower()
+                               == "female" else "Male"),
+                    "language": _clean_language(entry.get("language")),
+                    "published": "1" if publish else "0",
+                }
+                if source_name:
+                    props["source"] = f"src/{source_name}"
+                voices[target] = props
+
+            STORE.update(mutate)
+            self.drop_cached_state(target)
+
+            if replacing:
+                keep = {str(state_dest).lower()}
+                if source_dest is not None:
+                    keep.add(str(source_dest).lower())
+                for key in ("file", "source"):
+                    rel = replacing.get(key)
+                    if not rel:
+                        continue
+                    old = VOICES_DIR / rel
+                    if str(old).lower() in keep:
+                        continue
+                    if key == "source" and source_dest is None:
+                        progress(f'The "{target}" being replaced had an audio '
+                                 "sample and this package has none, so that "
+                                 "sample is being removed along with it.")
+                    try:
+                        old.unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("could not remove replaced file %s",
+                                       old)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+# Everything str.splitlines() treats as a line break. Any of these inside a
+# name or a value would split one voices.ini line into two when the file is
+# read back, letting a value invent a whole section, so they never get written.
+_LINE_BREAKS = "\r\n\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+
+
+def _ini_safe(value) -> str:
+    """A name or value that cannot break out of its voices.ini line."""
+    text = str(value)
+    for char in _LINE_BREAKS:
+        text = text.replace(char, " ")
+    return text.strip()
+
+
+def _clean_language(value) -> str:
+    """A hex LCID from an untrusted manifest, or the English default.
+
+    This lands in voices.ini verbatim and is read back by the SAPI enumerator,
+    so only the shape the format actually allows is accepted."""
+    text = str(value or "").strip()
+    return text if re.fullmatch(r"[0-9A-Fa-f]{1,8}", text) else "409"
+
+
+def _sha256_file(path, block=1 << 20) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(block)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _human_size(count) -> str:
+    size = float(count)
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if size < 1024.0 or unit == "GB":
+            if unit == "bytes":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} GB"
+
+
+def _pocket_tts_version() -> str:
+    try:
+        import pocket_tts
+        return str(getattr(pocket_tts, "__version__", "unknown"))
+    except Exception:   # noqa: BLE001
+        return "unknown"
+
+
+_MODEL_FINGERPRINT_CACHE = {}
+
+
+def _model_fingerprint() -> dict:
+    """Size and SHA-256 of the active model weights.
+
+    A voice embedding only sounds right on the weights that produced it, so a
+    package records this and an import compares it. Hashing 220 MB costs about
+    a second, so the answer is cached per (size, mtime)."""
+    path = MODELS_DIR / "english" / "model.safetensors"
+    try:
+        stat = path.stat()
+    except OSError:
+        return {"file": path.name, "sha256": "", "size": 0}
+    key = (str(path).lower(), stat.st_size, int(stat.st_mtime))
+    cached = _MODEL_FINGERPRINT_CACHE.get(key)
+    if cached is None:
+        cached = {"file": path.name, "sha256": _sha256_file(path),
+                  "size": stat.st_size}
+        _MODEL_FINGERPRINT_CACHE.clear()
+        _MODEL_FINGERPRINT_CACHE[key] = cached
+    return cached
+
+
+_MEMBER_BAD_CHARS = set('\\/:*?"<>|')
+
+
+def _member_stem(name: str, used: set) -> str:
+    """A file-name stem for `name` inside a package, unique within it."""
+    stem = "".join("_" if (c in _MEMBER_BAD_CHARS or ord(c) < 32) else c
+                   for c in name).strip(" .")[:60]
+    if not stem:
+        stem = "voice"
+    candidate = stem
+    counter = 2
+    while candidate.lower() in used:
+        candidate = f"{stem}_{counter}"
+        counter += 1
+    used.add(candidate.lower())
+    return candidate
+
+
+def _unique_name(base: str, voices: dict) -> str:
+    # Compared without case, and against the disk as well: Windows file names
+    # are case-insensitive, so "alba" and "Alba" are one file.
+    taken = {name.lower() for name in voices}
+    for counter in range(2, 1000):
+        candidate = _sanitize_name(f"{base} ({counter})")
+        if (candidate and candidate.lower() not in taken
+                and not (VOICES_DIR / f"{candidate}.safetensors").exists()):
+            return candidate
+    raise ValueError(f'too many voices are already named like "{base}"')
+
+
+def _read_manifest(archive: Path) -> dict:
+    if not archive.exists():
+        raise FileNotFoundError(f"the package was not found: {archive}")
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            with zf.open(PACKAGE_MANIFEST) as handle:
+                raw = handle.read(4 * 1024 * 1024)
+        manifest = json.loads(raw.decode("utf-8"))
+    except KeyError:
+        raise ValueError("this file is not a Pocket TTS voice package: there "
+                         "is no manifest inside it.") from None
+    except (zipfile.BadZipFile, OSError):
+        raise ValueError("this file is not a Pocket TTS voice package: it is "
+                         "not a readable archive.") from None
+    except (UnicodeError, ValueError):
+        raise ValueError("this package has a damaged manifest.") from None
+    if not isinstance(manifest, dict) or manifest.get("kind") != PACKAGE_KIND:
+        raise ValueError("this file is not a Pocket TTS voice package.")
+    fmt = manifest.get("format")
+    if not isinstance(fmt, int) or fmt > PACKAGE_FORMAT:
+        raise ValueError(
+            f"this package uses package format {fmt}, which this version does "
+            "not understand. Please update Pocket TTS SAPI5.")
+    voices = manifest.get("voices")
+    if not isinstance(voices, list) or not voices:
+        raise ValueError("this package contains no voices.")
+    if len(voices) > PACKAGE_MAX_VOICES:
+        raise ValueError("this package claims to hold more voices than the "
+                         "Voice Manager will install at once.")
+    # A name is the key the Voice Manager selects a voice by, so entries whose
+    # name could not survive the round trip are dropped here rather than
+    # listed and then not found.
+    usable = [entry for entry in voices
+              if isinstance(entry, dict)
+              and isinstance(entry.get("name"), str)
+              and entry["name"].strip()
+              and len(entry["name"].encode("utf-8")) <= 255]
+    if not usable:
+        raise ValueError("this package contains no usable voices.")
+    manifest["voices"] = usable
+    return manifest
+
+
+def _package_member(zf, member):
+    """Resolve a member named by the manifest, refusing anything unsafe.
+
+    Only the manifest's own references are ever opened, and a reference that
+    is absolute, drive-qualified or contains a path segment of "." or ".."
+    is rejected outright, so a hostile package cannot write outside the
+    staging directory."""
+    if not member or not isinstance(member, str):
+        raise ValueError("the package manifest has an invalid file reference")
+    parts = member.replace("\\", "/").split("/")
+    if (member.startswith(("/", "\\")) or ":" in member
+            or any(part in ("", ".", "..") for part in parts)):
+        raise ValueError(f"the package contains an unsafe path: {member!r}")
+    try:
+        info = zf.getinfo(member)
+    except KeyError:
+        raise ValueError(f"the package is missing {member!r}") from None
+    if info.is_dir():
+        raise ValueError(f"{member!r} is a directory, not a file")
+    if info.file_size > PACKAGE_MAX_MEMBER_BYTES:
+        raise ValueError(f"{member!r} is far larger than a voice file should "
+                         f"be ({info.file_size} bytes)")
+    return info
+
+
+def _extract_member(zf, info, dest: Path, expected_sha=None,
+                    budget=None) -> None:
+    if budget is not None:
+        budget[0] -= info.file_size
+        if budget[0] < 0:
+            raise ValueError(
+                "this package would write far more data than a set of voices "
+                "ever needs; it is being refused")
+    digest = hashlib.sha256()
+    with zf.open(info) as source, open(dest, "wb") as out:
+        while True:
+            chunk = source.read(1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+            out.write(chunk)
+    if expected_sha and digest.hexdigest() != str(expected_sha):
+        raise ValueError(f"{info.filename} is damaged: its checksum does not "
+                         "match the manifest")
+
+
+def _validate_state_file(path: Path) -> None:
+    """Confirm a file really is a Pocket TTS voice embedding before it is put
+    anywhere the engine would load it from."""
+    import safetensors
+    try:
+        with safetensors.safe_open(str(path), framework="pt") as handle:
+            keys = list(handle.keys())
+    except Exception as exc:   # noqa: BLE001
+        raise ValueError(f"the voice file cannot be read ({exc})") from None
+    if not keys:
+        raise ValueError("the voice file is empty")
+    if any(key.count("/") != 1 for key in keys):
+        raise ValueError("the voice file is not a Pocket TTS voice")
+
+
+def _read_name_list(payload, offset):
+    (count,) = struct.unpack_from("<I", payload, offset)
+    offset += 4
+    if count > PACKAGE_MAX_VOICES:
+        raise ValueError("too many voice names in the request")
+    names = []
+    for _ in range(count):
+        name, offset = _read_str16(payload, offset)
+        names.append(name)
+    return names, offset
+
+
+# On Windows these address a device rather than a file, whatever extension
+# follows them, so a voice may not be named after one.
+_RESERVED_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)])
+
 
 def _sanitize_name(name: str) -> str:
-    bad = set('[]=;\r\n\t"\\/|<>:*?')
-    cleaned = "".join(c for c in name if c not in bad).strip()
-    return cleaned[:60]
+    """A voice name safe to use as an ini section and as a file name.
+
+    Voice names arrive from the Clone dialog and from imported packages, and
+    the name becomes <name>.safetensors on disk, so anything that would change
+    which file is addressed has to go."""
+    bad = set('[]=;\t"\\/|<>:*?') | set(_LINE_BREAKS)
+    cleaned = "".join(c for c in name if c not in bad and ord(c) >= 32).strip()
+    # A leading or trailing dot or space is dropped by the file system, and a
+    # name of nothing but dots would be a relative path.
+    cleaned = cleaned.strip(". ")[:60].strip(". ")
+    if not cleaned:
+        return ""
+    if cleaned.split(".")[0].lower() in _RESERVED_NAMES:
+        cleaned += "_"
+    return cleaned
 
 
 STORE = VoiceStore()
@@ -507,6 +1221,17 @@ def _read_str16(payload, offset):
     offset += 2
     value = payload[offset:offset + length].decode("utf-8", "replace")
     return value, offset + length
+
+
+def _clip_utf8(text: str, limit: int) -> bytes:
+    """UTF-8 bytes for `text`, never longer than `limit` bytes and never
+    cut in the middle of a character."""
+    # "replace" because the text can come from a stranger's manifest, and
+    # an unencodable character must not take the connection down.
+    encoded = text.encode("utf-8", "replace")
+    if len(encoded) <= limit:
+        return encoded
+    return encoded[:limit].decode("utf-8", "ignore").encode("utf-8")
 
 
 def _read_str32(payload, offset):
@@ -573,6 +1298,12 @@ class Connection:
             self.handle_update(payload)
         elif cmd == CMD_INFO:
             self.handle_info()
+        elif cmd == CMD_EXPORT_VOICES:
+            self.handle_export(payload)
+        elif cmd == CMD_IMPORT_VOICES:
+            self.handle_import(payload)
+        elif cmd == CMD_INSPECT_PACKAGE:
+            self.handle_inspect(payload)
         elif cmd == CMD_SHUTDOWN:
             self.send(RESP_OK)
             self.server.shutdown_requested.set()
@@ -723,9 +1454,72 @@ class Connection:
         version = getattr(pocket_tts, "__version__", "3.x")
         state = "ready" if ENGINE.model is not None else (
             f"model not loaded: {ENGINE.load_error}")
-        info = (f"pocket-tts {version}; engine {state}; "
-                f"data dir {DATA_DIR}; sample rate 24000 Hz")
+        info = (f"Pocket TTS SAPI5 {APP_VERSION}; pocket-tts {version}; "
+                f"engine {state}; data dir {DATA_DIR}; "
+                "sample rate 24000 Hz")
         self.send_text(RESP_INFO, info)
+
+    def handle_export(self, payload):
+        try:
+            dest, offset = _read_str16(payload, 0)
+            (include_sources,) = struct.unpack_from("<B", payload, offset)
+            names, _ = _read_name_list(payload, offset + 1)
+        except (struct.error, IndexError, ValueError):
+            self.send_text(RESP_ERROR, "malformed EXPORT payload")
+            return
+        try:
+            summary = ENGINE.export_voices(
+                names, dest, bool(include_sources),
+                lambda msg: self.send_text(RESP_PROGRESS, msg))
+            self.send_text(RESP_OK, summary)
+        except Exception as exc:   # noqa: BLE001
+            logger.exception("export failed")
+            self.send_text(RESP_ERROR, str(exc))
+
+    def handle_import(self, payload):
+        try:
+            path, offset = _read_str16(payload, 0)
+            publish, collision = struct.unpack_from("<BB", payload, offset)
+            names, _ = _read_name_list(payload, offset + 2)
+        except (struct.error, IndexError, ValueError):
+            self.send_text(RESP_ERROR, "malformed IMPORT payload")
+            return
+        try:
+            summary = ENGINE.import_voices(
+                path, names, bool(publish), int(collision),
+                lambda msg: self.send_text(RESP_PROGRESS, msg))
+            self.send_text(RESP_OK, summary)
+        except Exception as exc:   # noqa: BLE001
+            logger.exception("import failed")
+            self.send_text(RESP_ERROR, str(exc))
+
+    def handle_inspect(self, payload):
+        try:
+            path, _ = _read_str16(payload, 0)
+        except (struct.error, IndexError):
+            self.send_text(RESP_ERROR, "malformed INSPECT payload")
+            return
+        try:
+            summary, rows = ENGINE.inspect_package(path)
+        except Exception as exc:   # noqa: BLE001
+            logger.info("inspecting %r failed: %s", path, exc)
+            self.send_text(RESP_ERROR, str(exc))
+            return
+        try:
+            text = _clip_utf8(summary, 60000)
+            parts = [struct.pack("<H", len(text)) + text,
+                     struct.pack("<I", len(rows))]
+            for name, female, has_source, status in rows:
+                encoded = _clip_utf8(name, 255)
+                parts.append(struct.pack("<H", len(encoded)) + encoded
+                             + struct.pack("<BBB", 1 if female else 0,
+                                           1 if has_source else 0,
+                                           int(status)))
+        except Exception as exc:   # noqa: BLE001
+            logger.exception("describing the package failed")
+            self.send_text(RESP_ERROR, str(exc))
+            return
+        self.send(RESP_PACKAGE, b"".join(parts))
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,8 @@
 #define IDD_CLONE           101
 #define IDD_TEST            102
 #define IDD_UPDATE          103
+#define IDD_EXPORT          104
+#define IDD_IMPORT          105
 
 #define IDC_VOICE_LIST      1001
 #define IDC_CLONE           1002
@@ -14,6 +16,8 @@
 #define IDC_UPDATE          1007
 #define IDC_REFRESH         1008
 #define IDC_STATUS          1009
+#define IDC_EXPORT          1010
+#define IDC_IMPORT          1011
 
 #define IDC_NAME            1101
 #define IDC_FILE            1102
@@ -26,3 +30,18 @@
 #define IDC_STOPBTN         1203
 
 #define IDC_TOKEN           1301
+
+#define IDC_EXPORT_LIST     1401
+#define IDC_EXPORT_ALL      1402
+#define IDC_EXPORT_NONE     1403
+#define IDC_EXPORT_SOURCES  1404
+#define IDC_EXPORT_FILE     1405
+#define IDC_EXPORT_BROWSE   1406
+
+#define IDC_IMPORT_FILE     1501
+#define IDC_IMPORT_BROWSE   1502
+#define IDC_IMPORT_LIST     1503
+#define IDC_IMPORT_ALL      1504
+#define IDC_IMPORT_NONE     1505
+#define IDC_IMPORT_COLLISION 1506
+#define IDC_IMPORT_PUBLISH  1507

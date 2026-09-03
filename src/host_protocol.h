@@ -18,10 +18,22 @@ enum HostCommand : uint32_t {
     CMD_UPDATE_MODELS = 7,  // <u16+hf_token (may be empty)>
     CMD_SHUTDOWN = 8,
     CMD_INFO = 9,
+    // Voice packages (.pttsvoices), for sharing voices between computers.
+    // An empty name list means "every voice".
+    CMD_EXPORT_VOICES = 10,   // <u16+dest_path><u8 include_sources><u32 count>{<u16+name>}
+    CMD_IMPORT_VOICES = 11,   // <u16+package_path><u8 publish><u8 collision><u32 count>{<u16+name>}
+    CMD_INSPECT_PACKAGE = 12, // <u16+package_path>
+};
+
+// What an import does with a voice whose name is already in use.
+enum HostCollisionMode : uint8_t {
+    COLLISION_SKIP = 0,
+    COLLISION_RENAME = 1,
+    COLLISION_REPLACE = 2,
 };
 
 enum HostResponse : uint32_t {
-    RESP_OK = 0,
+    RESP_OK = 0,          // payload: utf8 summary for long operations, else empty
     RESP_ERROR = 1,       // payload: utf8 message
     RESP_AUDIO = 2,       // payload: raw PCM, 16-bit mono 24000 Hz
     RESP_AUDIO_END = 3,
@@ -29,6 +41,14 @@ enum HostResponse : uint32_t {
     RESP_PONG = 5,
     RESP_PROGRESS = 6,    // payload: utf8 message
     RESP_INFO = 7,        // payload: utf8 message
+    RESP_PACKAGE = 8,     // <u16+summary><u32 count>{<u16+name><u8 female><u8 has_src><u8 status>}
+};
+
+// Per-voice status in a RESP_PACKAGE reply.
+enum HostPackageStatus : uint8_t {
+    PACKAGE_READY = 0,        // made with this computer's model
+    PACKAGE_WILL_REBUILD = 1, // other model, but the audio sample is included
+    PACKAGE_NO_SAMPLE = 2,    // other model and no audio sample
 };
 
 // Host candidate ports, tried in order; the active one is written to

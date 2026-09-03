@@ -20,11 +20,24 @@ struct HostVoice {
     bool hasSource = false;
 };
 
+// One voice inside a .pttsvoices package, as reported by inspectPackage.
+struct PackageVoice {
+    std::wstring name;
+    bool female = false;
+    bool hasSource = false;
+    uint8_t status = PACKAGE_READY;
+};
+
+struct PackageInfo {
+    std::wstring summary;   // human-readable description of the package
+    std::vector<PackageVoice> voices;
+};
+
 class HostClient {
 public:
     // Returns false to stop the utterance (abort).
     using AudioCallback = bool(*)(const char* pcm, uint32_t size, void* user);
-    // Progress text for long operations (clone, model update).
+    // Progress text for long operations (clone, model update, export, import).
     using ProgressCallback = void(*)(const std::wstring& message, void* user);
 
     HostClient();
@@ -49,6 +62,20 @@ public:
     bool deleteVoice(const std::wstring& name, std::wstring& error);
     bool updateModels(const std::wstring& hfToken,
                       ProgressCallback progress, void* user, std::wstring& error);
+
+    // Voice packages. An empty `names` means every voice in the store, or
+    // every voice in the package.
+    bool exportVoices(const std::vector<std::wstring>& names,
+                      const std::wstring& destPath, bool includeSources,
+                      ProgressCallback progress, void* user,
+                      std::wstring& summary, std::wstring& error);
+    bool inspectPackage(const std::wstring& packagePath, PackageInfo& out,
+                        std::wstring& error);
+    bool importVoices(const std::wstring& packagePath,
+                      const std::vector<std::wstring>& names, bool publish,
+                      uint8_t collision, ProgressCallback progress, void* user,
+                      std::wstring& summary, std::wstring& error);
+
     bool info(std::wstring& out);
     void shutdownServer();
 
@@ -61,6 +88,10 @@ private:
     bool launchHost();
     bool sendFrame(uint32_t type, const void* data, uint32_t size);
     bool readFrame(uint32_t& type, std::vector<char>& payload);
+    // Drains RESP_PROGRESS frames until the operation ends; on success the
+    // RESP_OK payload is returned in `summary`.
+    bool pumpLongOperation(ProgressCallback progress, void* user,
+                           std::wstring& summary, std::wstring& error);
     void setRecvTimeout(DWORD ms);
 
     SOCKET sock_;
