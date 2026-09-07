@@ -59,7 +59,7 @@ PORT_FILE = _local_dir() / "host.port"
 LOG_FILE = _local_dir() / "host.log"
 
 # Kept in step with CMakeLists.txt and installer/pockettts.iss.
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 # Commands
 CMD_PING = 0
@@ -86,6 +86,9 @@ RESP_PONG = 5
 RESP_PROGRESS = 6
 RESP_INFO = 7
 RESP_PACKAGE = 8
+
+# The model's native output format, matching src/host_protocol.h.
+POCKETTTS_SAMPLE_RATE = 24000
 
 logger = logging.getLogger("pockettts_host")
 
@@ -139,6 +142,44 @@ speaker has agreed to. The default voices (Alba, Jane, George and Michael) come
 from Kyutai's kyutai/tts-voices dataset; see that repository for their
 individual licenses.
 """
+
+
+# ---------------------------------------------------------------------------
+# Generation speed
+# ---------------------------------------------------------------------------
+#
+# How much audio this machine produces per second of work: 2.5 on a fast
+# desktop, well under 1.0 on an old laptop. A client that plays audio the
+# moment it arrives runs dry on the slow machines and the speech breaks up,
+# so the figure is reported with every PONG and AUDIO_END frame and the SAPI
+# engine uses it to decide how much audio to bank before playback starts.
+#
+# Time spent handing audio to the client is excluded: that is the client's
+# playback rate, not this machine's generation rate.
+
+class SpeedTracker:
+    def __init__(self, alpha=0.3):
+        self.alpha = alpha
+        self.value = 0.0        # 0.0 = not measured yet
+        self.lock = threading.Lock()
+
+    def update(self, audio_ms, work_ms):
+        if audio_ms < 200 or work_ms <= 0:
+            return              # too short to say anything about throughput
+        factor = audio_ms / work_ms
+        with self.lock:
+            self.value = (factor if self.value <= 0.0 else
+                          self.alpha * factor + (1.0 - self.alpha) * self.value)
+
+    def get(self) -> float:
+        with self.lock:
+            return self.value
+
+    def packed(self) -> bytes:
+        return struct.pack("<f", self.get())
+
+
+SPEED = SpeedTracker()
 
 
 # ---------------------------------------------------------------------------
@@ -259,10 +300,16 @@ class Engine:
             if name is None:
                 return
             state = self.get_voice_state(name, voices)
+            produced = 0
+            t0 = time.monotonic()
             with self.gen_lock:
-                for _ in self._stream_chunks(state, "Ready.", threading.Event()):
-                    pass
-            logger.info("warm-up generation done")
+                for pcm in self._stream_chunks(state, "Ready.",
+                                               threading.Event()):
+                    produced += len(pcm)
+            audio_ms = produced / 2 / POCKETTTS_SAMPLE_RATE * 1000
+            SPEED.update(audio_ms, (time.monotonic() - t0) * 1000)
+            logger.info("warm-up generation done (machine x%.2f realtime)",
+                        SPEED.get())
         except Exception:
             logger.exception("warm-up failed (non-fatal)")
 
@@ -427,6 +474,7 @@ class Engine:
         voices = STORE.read()
         state = self.get_voice_state(voice_name, voices)
         emitted = 0
+        emit_seconds = 0.0
         with self.gen_lock:
             if cancel.is_set():
                 logger.debug("speak cancelled before generation started")
@@ -435,12 +483,22 @@ class Engine:
                 if cancel.is_set():
                     break
                 emitted += len(pcm)
+                # emit blocks while the client's audio device drains, which
+                # is playback time, not generation time.
+                t_emit = time.monotonic()
                 emit(pcm)
+                emit_seconds += time.monotonic() - t_emit
+        elapsed = time.monotonic() - t0
+        audio_ms = emitted / 2 / POCKETTTS_SAMPLE_RATE * 1000
+        work_ms = (elapsed - emit_seconds) * 1000
+        if not cancel.is_set():
+            SPEED.update(audio_ms, work_ms)
         logger.info(
-            "speak: voice %r, %d chars -> %d ms audio in %d ms%s",
-            voice_name, len(text), int(emitted / 2 / 24000 * 1000),
-            int((time.monotonic() - t0) * 1000),
-            " (cancelled)" if cancel.is_set() else "")
+            "speak: voice %r, %d chars -> %d ms audio in %d ms "
+            "(%d ms generating, x%.2f realtime, machine x%.2f)%s",
+            voice_name, len(text), int(audio_ms), int(elapsed * 1000),
+            int(work_ms), audio_ms / work_ms if work_ms > 0 else 0.0,
+            SPEED.get(), " (cancelled)" if cancel.is_set() else "")
 
     # -- cloning ------------------------------------------------------------
 
@@ -1279,7 +1337,7 @@ class Connection:
 
     def dispatch(self, cmd, payload):
         if cmd == CMD_PING:
-            self.send(RESP_PONG)
+            self.send(RESP_PONG, SPEED.packed())
         elif cmd == CMD_STOP:
             logger.debug("STOP received from %s", self.addr)
             self.cancel.set()
@@ -1331,12 +1389,12 @@ class Connection:
             try:
                 ENGINE.speak(voice, text, cancel,
                              lambda pcm: self.send(RESP_AUDIO, pcm))
-                self.send(RESP_AUDIO_END)
+                self.send(RESP_AUDIO_END, SPEED.packed())
             except Exception as exc:   # noqa: BLE001
                 logger.exception("speak failed")
                 try:
                     self.send_text(RESP_ERROR, str(exc))
-                    self.send(RESP_AUDIO_END)
+                    self.send(RESP_AUDIO_END, SPEED.packed())
                 except OSError:
                     pass
 

@@ -51,6 +51,11 @@ public:
     bool connect(DWORD timeoutMs = 90000);
     bool isConnected() const { return sock_ != INVALID_SOCKET; }
 
+    // How much audio the host machine generates per second of work, as
+    // last reported by the host: above 1.0 is faster than realtime,
+    // POCKETTTS_SPEED_UNKNOWN while the host has not measured anything.
+    float speedFactor() const { return speedFactor_; }
+
     bool speak(const std::string& voiceUtf8, const std::string& textUtf8,
                AudioCallback callback, void* user);
 
@@ -94,7 +99,10 @@ private:
                            std::wstring& summary, std::wstring& error);
     void setRecvTimeout(DWORD ms);
 
+    void noteSpeedFactor(const std::vector<char>& payload);
+
     SOCKET sock_;
     CRITICAL_SECTION cs_;
     bool wsaReady_;
+    volatile float speedFactor_;
 };

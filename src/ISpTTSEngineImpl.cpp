@@ -34,6 +34,21 @@ float pitch_to_multiplier(int pitch)
     return std::pow(2.0f, static_cast<float>(pitch) / 12.0f);
 }
 
+// Playback lead-in. The site starts playing the moment it is handed audio,
+// so on a machine that generates speech slower than it plays, the sound
+// device runs dry over and over and the speech breaks up. Banking a little
+// audio first gives playback a cushion to run on. Machines that generate
+// comfortably faster than realtime need none, and get none: the first
+// audio still reaches the site within a couple of hundred milliseconds.
+constexpr float LEAD_IN_MS_PER_CHAR = 60.0f;   // this model's speaking rate
+constexpr float LEAD_IN_FAST_ENOUGH = 1.25f;   // no lead-in above this
+constexpr float LEAD_IN_MAX_AUDIO_MS = 1000.0f;
+constexpr float LEAD_IN_MAX_WALL_MS = 1200.0f;  // cap on the delay before speech
+constexpr float LEAD_IN_MIN_MS = 100.0f;        // below this it is not worth it
+
+// Merging stops here so one request stays interruptible and bounded.
+constexpr size_t MAX_MERGED_CHARS = 8000;
+
 struct SpeakContext {
     ISpTTSEngineSite* caller = nullptr;
     AudioPost post;
@@ -44,9 +59,12 @@ struct SpeakContext {
     float speed = 1.0f;
     float pitch = 1.0f;
     std::vector<int16_t> processed;
+    std::vector<int16_t> bank;  // audio held back until playback starts
+    size_t lead_in_samples = 0;
+    bool playing = true;
 };
 
-bool write_pcm(SpeakContext* ctx, const int16_t* samples, size_t count)
+bool site_write(SpeakContext* ctx, const int16_t* samples, size_t count)
 {
     if (count == 0) {
         return true;
@@ -60,8 +78,96 @@ bool write_pcm(SpeakContext* ctx, const int16_t* samples, size_t count)
         DEBUG_LOG("write_pcm: Write failed 0x%08X", hr);
         return false;
     }
-    ctx->bytes_written += bytes;
     return true;
+}
+
+bool write_pcm(SpeakContext* ctx, const int16_t* samples, size_t count)
+{
+    if (count == 0) {
+        return true;
+    }
+    ctx->bytes_written += count * sizeof(int16_t);
+    if (ctx->playing) {
+        return site_write(ctx, samples, count);
+    }
+    ctx->bank.insert(ctx->bank.end(), samples, samples + count);
+    if (ctx->bank.size() < ctx->lead_in_samples) {
+        return true;
+    }
+    ctx->playing = true;
+    const bool ok = site_write(ctx, ctx->bank.data(), ctx->bank.size());
+    ctx->bank.clear();
+    ctx->bank.shrink_to_fit();
+    return ok;
+}
+
+// An utterance can end before the lead-in target is reached; hand over
+// whatever is banked.
+bool flush_bank(SpeakContext* ctx)
+{
+    const bool banked = !ctx->playing && !ctx->bank.empty();
+    ctx->playing = true;
+    if (!banked) {
+        return true;
+    }
+    const bool ok = site_write(ctx, ctx->bank.data(), ctx->bank.size());
+    ctx->bank.clear();
+    ctx->bank.shrink_to_fit();
+    return ok;
+}
+
+// POCKETTTS_LEAD_IN_MS overrides the automatic choice: 0 disables the
+// lead-in, a positive value fixes it at that many milliseconds.
+long lead_in_override()
+{
+    wchar_t buf[16];
+    const DWORD n = GetEnvironmentVariableW(L"POCKETTTS_LEAD_IN_MS", buf, 16);
+    if (n == 0 || n >= 16) {
+        return -1;
+    }
+    return wcstol(buf, nullptr, 10);
+}
+
+// Playback consumes `speed` seconds of model audio per second while the host
+// produces `factor` of them, so an utterance runs a deficit that has to be
+// banked before it starts. Capped, because waiting is its own annoyance.
+size_t lead_in_samples_for(size_t chars, float speed, float factor)
+{
+    float ms = 0.0f;
+    const long override_ms = lead_in_override();
+    if (override_ms >= 0) {
+        ms = static_cast<float>(override_ms);
+    } else if (factor > 0.0f && speed > 0.0f && chars > 0) {
+        const float effective = factor / speed;
+        if (effective >= LEAD_IN_FAST_ENOUGH) {
+            return 0;
+        }
+        const float playback_ms = chars * LEAD_IN_MS_PER_CHAR / speed;
+        const float needed = playback_ms * (1.0f / effective - 1.0f);
+        const float cap = (std::min)(LEAD_IN_MAX_AUDIO_MS,
+                                     LEAD_IN_MAX_WALL_MS * effective);
+        ms = std::clamp(needed, 0.0f, cap);
+        if (ms < LEAD_IN_MIN_MS) {
+            return 0;
+        }
+    }
+    return static_cast<size_t>(ms * POCKETTTS_SAMPLE_RATE / 1000.0f);
+}
+
+// Consecutive fragments that sound alike are spoken in one request. Every
+// request costs a full model set-up, and Narrator alone splits a short
+// announcement like "Pat, 7 of 88, selected," into three fragments: sent
+// separately they arrive as three utterances with a pause between each.
+bool same_prosody(const SPVTEXTFRAG* a, const SPVTEXTFRAG* b)
+{
+    return a->State.eAction == b->State.eAction
+        && a->State.LangID == b->State.LangID
+        && a->State.EmphAdj == b->State.EmphAdj
+        && a->State.RateAdj == b->State.RateAdj
+        && a->State.Volume == b->State.Volume
+        && a->State.PitchAdj.MiddleAdj == b->State.PitchAdj.MiddleAdj
+        && a->State.PitchAdj.RangeAdj == b->State.PitchAdj.RangeAdj
+        && a->State.pPhoneIds == nullptr && b->State.pPhoneIds == nullptr;
 }
 
 bool speak_callback(const char* data, uint32_t size, void* user)
@@ -237,7 +343,24 @@ STDMETHODIMP ISpTTSEngineImpl::Speak(
         SpeakContext ctx;
         ctx.caller = pOutputSite;
 
-        for (const SPVTEXTFRAG* frag = pTextFragList; frag; frag = frag->pNext) {
+        size_t speakable_chars = 0;
+        for (const SPVTEXTFRAG* f = pTextFragList; f; f = f->pNext) {
+            if (f->State.eAction == SPVA_Speak || f->State.eAction == SPVA_SpellOut) {
+                speakable_chars += f->ulTextLen;
+            }
+        }
+        const float host_speed = g_hostClient->speedFactor();
+        ctx.lead_in_samples = lead_in_samples_for(
+            speakable_chars, rate_to_speed(static_cast<int>(sapi_rate)), host_speed);
+        ctx.playing = (ctx.lead_in_samples == 0);
+        if (!ctx.playing) {
+            DEBUG_LOG("lead-in: banking %u ms of audio (host x%.2f realtime)",
+                      static_cast<unsigned>(ctx.lead_in_samples * 1000 /
+                                            POCKETTTS_SAMPLE_RATE),
+                      host_speed);
+        }
+
+        for (const SPVTEXTFRAG* frag = pTextFragList; frag; ) {
             const DWORD actions = pOutputSite->GetActions();
             if (actions & SPVES_ABORT) {
                 break;
@@ -277,6 +400,7 @@ STDMETHODIMP ISpTTSEngineImpl::Speak(
                     event.ullAudioStreamOffset = ctx.bytes_written;
                     pOutputSite->AddEvents(&event, 1);
                 }
+                frag = frag->pNext;
                 continue;
             }
 
@@ -289,17 +413,41 @@ STDMETHODIMP ISpTTSEngineImpl::Speak(
                         break;
                     }
                 }
+                frag = frag->pNext;
                 continue;
             }
 
             if (frag->State.eAction != SPVA_Speak && frag->State.eAction != SPVA_SpellOut) {
+                frag = frag->pNext;
                 continue;
             }
             if (frag->ulTextLen == 0 || !frag->pTextStart) {
+                frag = frag->pNext;
                 continue;
             }
 
+            // Gather the run of fragments this one request will speak. A
+            // bookmark, a silence or any change of prosody ends the run, so
+            // an application that relies on those still gets them in place.
+            std::vector<const SPVTEXTFRAG*> run{frag};
+            const SPVTEXTFRAG* after_run = frag->pNext;
             std::wstring wide_text(frag->pTextStart, frag->ulTextLen);
+            if (frag->State.eAction == SPVA_Speak) {
+                while (after_run && after_run->pTextStart && after_run->ulTextLen > 0
+                       && same_prosody(frag, after_run)
+                       && wide_text.size() + after_run->ulTextLen <= MAX_MERGED_CHARS) {
+                    // SAPI usually leaves the separating whitespace in the
+                    // fragments; supply it where it did not.
+                    if (!wide_text.empty() && !iswspace(wide_text.back())
+                        && !iswspace(after_run->pTextStart[0])) {
+                        wide_text.push_back(L' ');
+                    }
+                    wide_text.append(after_run->pTextStart, after_run->ulTextLen);
+                    run.push_back(after_run);
+                    after_run = after_run->pNext;
+                }
+            }
+
             if (frag->State.eAction == SPVA_SpellOut) {
                 // Space the characters out so the model spells them.
                 std::wstring spelled;
@@ -316,39 +464,42 @@ STDMETHODIMP ISpTTSEngineImpl::Speak(
             const std::string text = utils::wstring_to_string(wide_text);
             if (text.empty() ||
                 text.find_first_not_of(" \t\r\n") == std::string::npos) {
+                frag = after_run;
                 continue;  // pocket-tts rejects empty prompts
             }
 
-            if (send_sentence_events) {
-                SPEVENT event = {};
-                event.eEventId = SPEI_SENTENCE_BOUNDARY;
-                event.elParamType = SPET_LPARAM_IS_UNDEFINED;
-                event.ullAudioStreamOffset = ctx.bytes_written;
-                event.lParam = frag->ulTextSrcOffset;
-                event.wParam = frag->ulTextLen;
-                pOutputSite->AddEvents(&event, 1);
-            }
+            for (const SPVTEXTFRAG* part : run) {
+                if (send_sentence_events) {
+                    SPEVENT event = {};
+                    event.eEventId = SPEI_SENTENCE_BOUNDARY;
+                    event.elParamType = SPET_LPARAM_IS_UNDEFINED;
+                    event.ullAudioStreamOffset = ctx.bytes_written;
+                    event.lParam = part->ulTextSrcOffset;
+                    event.wParam = part->ulTextLen;
+                    pOutputSite->AddEvents(&event, 1);
+                }
 
-            if (send_word_events) {
-                const wchar_t* text_start = frag->pTextStart;
-                const ULONG text_len = frag->ulTextLen;
-                bool in_word = false;
-                ULONG word_start = 0;
-                for (ULONG i = 0; i <= text_len; ++i) {
-                    const bool is_word_char = (i < text_len) &&
-                        (iswalnum(text_start[i]) || text_start[i] == L'\'' || text_start[i] == L'-');
-                    if (is_word_char && !in_word) {
-                        word_start = i;
-                        in_word = true;
-                    } else if (!is_word_char && in_word) {
-                        SPEVENT event = {};
-                        event.eEventId = SPEI_WORD_BOUNDARY;
-                        event.elParamType = SPET_LPARAM_IS_UNDEFINED;
-                        event.ullAudioStreamOffset = ctx.bytes_written;
-                        event.lParam = frag->ulTextSrcOffset + word_start;
-                        event.wParam = i - word_start;
-                        pOutputSite->AddEvents(&event, 1);
-                        in_word = false;
+                if (send_word_events) {
+                    const wchar_t* text_start = part->pTextStart;
+                    const ULONG text_len = part->ulTextLen;
+                    bool in_word = false;
+                    ULONG word_start = 0;
+                    for (ULONG i = 0; i <= text_len; ++i) {
+                        const bool is_word_char = (i < text_len) &&
+                            (iswalnum(text_start[i]) || text_start[i] == L'\'' || text_start[i] == L'-');
+                        if (is_word_char && !in_word) {
+                            word_start = i;
+                            in_word = true;
+                        } else if (!is_word_char && in_word) {
+                            SPEVENT event = {};
+                            event.eEventId = SPEI_WORD_BOUNDARY;
+                            event.elParamType = SPET_LPARAM_IS_UNDEFINED;
+                            event.ullAudioStreamOffset = ctx.bytes_written;
+                            event.lParam = part->ulTextSrcOffset + word_start;
+                            event.wParam = i - word_start;
+                            pOutputSite->AddEvents(&event, 1);
+                            in_word = false;
+                        }
                     }
                 }
             }
@@ -363,7 +514,8 @@ STDMETHODIMP ISpTTSEngineImpl::Speak(
             const float volume = (sapi_volume / 100.0f) * ctx.frag_volume;
             ctx.post.configure(ctx.speed, ctx.pitch, volume);
 
-            DEBUG_LOG("fragment: speed %.2f pitch %.2f volume %.2f text \"%s\"",
+            DEBUG_LOG("fragment: %u parts, speed %.2f pitch %.2f volume %.2f "
+                      "text \"%s\"", static_cast<unsigned>(run.size()),
                       ctx.speed, ctx.pitch, volume, text.c_str());
 
             g_hostClient->speak(voice_name_utf8_, text, speak_callback, &ctx);
@@ -371,12 +523,14 @@ STDMETHODIMP ISpTTSEngineImpl::Speak(
             if (ctx.aborted) {
                 break;
             }
+            frag = after_run;
         }
 
         if (!ctx.aborted) {
             ctx.processed.clear();
             ctx.post.finish(ctx.processed);
             write_pcm(&ctx, ctx.processed.data(), ctx.processed.size());
+            flush_bank(&ctx);
         }
 
         DEBUG_LOG("=== Speak done (%llu bytes) ===", ctx.bytes_written);

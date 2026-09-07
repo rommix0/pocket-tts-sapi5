@@ -111,6 +111,7 @@ std::wstring host_command()
 HostClient::HostClient()
     : sock_(INVALID_SOCKET)
     , wsaReady_(false)
+    , speedFactor_(POCKETTTS_SPEED_UNKNOWN)
 {
     InitializeCriticalSection(&cs_);
     WSADATA wsa;
@@ -131,6 +132,20 @@ void HostClient::disconnect()
     if (sock_ != INVALID_SOCKET) {
         closesocket(sock_);
         sock_ = INVALID_SOCKET;
+    }
+}
+
+// PONG and AUDIO_END carry the host's measured generation speed. Hosts
+// older than 1.1.1 send neither, and the factor simply stays unknown.
+void HostClient::noteSpeedFactor(const std::vector<char>& payload)
+{
+    if (payload.size() < sizeof(float)) {
+        return;
+    }
+    float factor = POCKETTTS_SPEED_UNKNOWN;
+    memcpy(&factor, payload.data(), sizeof(factor));
+    if (factor > 0.0f && factor < 100.0f) {
+        speedFactor_ = factor;
     }
 }
 
@@ -190,6 +205,7 @@ bool HostClient::tryPort(unsigned short port)
         disconnect();
         return false;
     }
+    noteSpeedFactor(payload);
     return true;
 }
 
@@ -393,6 +409,7 @@ bool HostClient::speak(const std::string& voiceUtf8, const std::string& textUtf8
             return false;
         }
         if (type == RESP_AUDIO_END) {
+            noteSpeedFactor(data);
             break;
         }
         if (type == RESP_ERROR) {

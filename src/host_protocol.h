@@ -36,9 +36,9 @@ enum HostResponse : uint32_t {
     RESP_OK = 0,          // payload: utf8 summary for long operations, else empty
     RESP_ERROR = 1,       // payload: utf8 message
     RESP_AUDIO = 2,       // payload: raw PCM, 16-bit mono 24000 Hz
-    RESP_AUDIO_END = 3,
+    RESP_AUDIO_END = 3,   // <f32 speed_factor> (see below; absent on old hosts)
     RESP_VOICES = 4,      // <u32 count>{<u16+name><u8 female><u32 lcid><u8 published><u8 has_src>}
-    RESP_PONG = 5,
+    RESP_PONG = 5,        // <f32 speed_factor> (absent on old hosts)
     RESP_PROGRESS = 6,    // payload: utf8 message
     RESP_INFO = 7,        // payload: utf8 message
     RESP_PACKAGE = 8,     // <u16+summary><u32 count>{<u16+name><u8 female><u8 has_src><u8 status>}
@@ -55,6 +55,13 @@ enum HostPackageStatus : uint8_t {
 // %LOCALAPPDATA%\PocketTTS\host.port.
 constexpr unsigned short POCKETTTS_PORTS[] = {17853, 17854, 17855, 17856, 17857};
 constexpr int POCKETTTS_PORT_COUNT = 5;
+
+// How much audio the host machine generates per second of work: above 1.0
+// means faster than realtime. Reported by the host in PONG and AUDIO_END,
+// 0.0 while it has nothing to report. The SAPI engine banks audio before
+// starting playback when this is low, so that speech does not break up on
+// machines that cannot generate faster than they play.
+constexpr float POCKETTTS_SPEED_UNKNOWN = 0.0f;
 
 constexpr unsigned long POCKETTTS_SAMPLE_RATE = 24000;
 constexpr unsigned short POCKETTTS_CHANNELS = 1;
