@@ -114,10 +114,11 @@ Voices live in `voices.ini`; the enumerator DLL reads it directly, so publishing
 
 ### Speech on slower machines
 
-Windows plays each piece of audio the moment the engine hands it over, so a PC that generates speech more slowly than it plays it will run the sound device dry part-way through a sentence and the speech breaks up. Two things keep that from happening:
+Windows plays each piece of audio the moment the engine hands it over, so a PC that generates speech more slowly than it plays it will run the sound device dry part-way through a sentence and the speech breaks up. Three things keep that from happening:
 
 - **One request per phrase.** Applications hand SAPI a sentence in several fragments — Narrator splits even "Pat, 7 of 88, selected," into three. Fragments that sound alike are merged into a single request, because each request costs a full model set-up. A bookmark, a silence, or any change of rate, pitch, volume or emphasis ends the merge, so applications that rely on those still get them in place.
 - **A playback lead-in.** The host measures how much audio this machine generates per second of work and reports it with every reply. When it cannot keep ahead of playback, the engine banks a little audio before letting Windows start playing, so playback has a cushion to run on. Machines that are comfortably faster than realtime bank nothing and keep their ~200 ms latency. Set `POCKETTTS_LEAD_IN_MS` to fix the lead-in at a number of milliseconds, or to `0` to switch it off.
+- **Full speed, whichever program started the engine.** Windows ranks a process that has no window of its own by the program that started it, and once that program closes it treats the process as background work, which it may run at a lower CPU speed or on the power-saving cores. The engine host tells Windows it is foreground work, so it keeps full speed after the program that started it has closed, and for every program that speaks through it afterwards.
 
 A machine slower than about 0.5x realtime cannot read long passages without gaps whatever the engine does; `host.log` records the measured figure on every utterance.
 

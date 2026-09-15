@@ -59,7 +59,7 @@ PORT_FILE = _local_dir() / "host.port"
 LOG_FILE = _local_dir() / "host.log"
 
 # Kept in step with CMakeLists.txt and installer/pockettts.iss.
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 # Commands
 CMD_PING = 0
@@ -1647,6 +1647,60 @@ def _already_running() -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Scheduling
+# ---------------------------------------------------------------------------
+#
+# Windows ranks a process that has no window of its own by the program that
+# started it: while that program is in focus the host runs at full speed, and
+# once the program closes the host counts as background work, which Windows
+# may move to a slower CPU speed or to the power-saving cores. Reopening the
+# program does not undo that, because the running host is not the new
+# program's child, so on a PC with little speed to spare the speech broke up
+# from the second session on, until the host was restarted. The host is
+# foreground work for whoever is listening, and tells Windows so explicitly,
+# which holds however it was started.
+
+_PROCESS_POWER_THROTTLING = 4           # PROCESS_INFORMATION_CLASS
+_POWER_THROTTLING_CURRENT_VERSION = 1
+_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+
+
+class _PowerThrottlingState(ctypes.Structure):
+    _fields_ = [("Version", ctypes.c_ulong),
+                ("ControlMask", ctypes.c_ulong),
+                ("StateMask", ctypes.c_ulong)]
+
+
+def _opt_out_of_background_throttling():
+    from ctypes import wintypes
+
+    # A private kernel32, so these prototypes do not leak into ctypes.windll.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    try:
+        set_information = kernel32.SetProcessInformation
+    except AttributeError:
+        logger.warning("scheduling: this Windows cannot opt out of power "
+                       "throttling")
+        return
+    set_information.argtypes = (wintypes.HANDLE, ctypes.c_int,
+                                ctypes.c_void_p, wintypes.DWORD)
+    set_information.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+
+    # Taking control of execution speed and leaving it switched off is the
+    # documented way to ask for HighQoS.
+    state = _PowerThrottlingState(_POWER_THROTTLING_CURRENT_VERSION,
+                                  _POWER_THROTTLING_EXECUTION_SPEED, 0)
+    if set_information(kernel32.GetCurrentProcess(), _PROCESS_POWER_THROTTLING,
+                       ctypes.byref(state), ctypes.sizeof(state)):
+        logger.info("scheduling: running as foreground work (HighQoS)")
+    else:
+        # Windows 10 before 1709 has no power throttling to opt out of.
+        logger.warning("scheduling: could not opt out of power throttling "
+                       "(error %d)", ctypes.get_last_error())
+
+
 def main():
     handler = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=2,
                                   encoding="utf-8")
@@ -1672,6 +1726,7 @@ def main():
         ctypes.windll.kernel32.SetConsoleTitleW("Pocket TTS engine host")
     except OSError:
         pass
+    _opt_out_of_background_throttling()
 
     ENGINE.load()
     threading.Thread(target=ENGINE.warm_up, daemon=True).start()
